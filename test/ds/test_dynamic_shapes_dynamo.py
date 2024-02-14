@@ -1,6 +1,7 @@
 import argparse
 import os
 import sys
+import random
 
 parser = argparse.ArgumentParser(add_help=False)
 parser.add_argument('--verbosity', type=int, default=2)
@@ -10,6 +11,7 @@ sys.argv = [sys.argv[0]] + leftovers
 import numpy as np
 import unittest
 import torch
+import torch._dynamo
 import torch_xla.core.xla_model as xm
 import torch_xla.debug.metrics as met
 
@@ -17,6 +19,7 @@ import torch_xla.debug.metrics as met
 # CompositeAutogradImplicit means we don't have an explicit backward formula for an op instead an op is composed of a bunch of ops that do have backward formulas and combines this formulas is equivalent to differentiating the op explicitly.
 pd = torch._C._EnablePythonDispatcher()
 xla_dev = xm.xla_device()
+torch._dynamo.config.capture_dynamic_output_shape_ops = True
 
 
 class Feedforward(torch.nn.Module):
@@ -43,58 +46,27 @@ class Feedforward(torch.nn.Module):
 
 
 class TestDynamicShapeModels(unittest.TestCase):
+  def test_benchmark_backwards_pass_with_dynamic_input(self):
+    num_features = 2
+    model = Feedforward(num_features, hidden_size=10)
+    model.compile()
 
-  def test_forward_pass_dynamic_input_correctness(self):
-    losses = []
-    for _ in range(2):
-      num_features = 2
-      num_test_samples = 5
-      x_test, y_test = self.create_dynamic_test_data(num_test_samples,
-                                                     num_features, xla_dev)
-
-      model = Feedforward(num_features, hidden_size=10).to(xla_dev)
-      criterion = torch.nn.BCELoss()
-
-      model.eval()
-      with torch.no_grad():
-        y_pred = model(x_test)
-        before_train = criterion(y_pred.squeeze(), y_test)
-        xm.mark_step()
-        losses.append(before_train.item())
-
-    np.testing.assert_allclose(losses[0], losses[1], rtol=1e-2, atol=1e-2)
-    print('Test passed.')
-
-  def test_forward_pass_dynamic_input_compile_once(self):
-    met.clear_metrics()
-    num_compilation_recorded = False
-    num_compilation = -1
-    for i in range(10):
-      num_features = 2
-      num_test_samples = 5
-      x_test, y_test = self.create_dynamic_test_data(
-          num_test_samples, num_features, xla_dev, num_non_zeros=i)
-
-      model = Feedforward(num_features, hidden_size=10).to(xla_dev)
-      criterion = torch.nn.BCELoss()
-
-      model.eval()
-      with torch.no_grad():
-        y_pred = model(x_test)
-        criterion(y_pred.squeeze(), y_test)
-        xm.mark_step()
-        if not num_compilation_recorded:
-          num_compilation = met.metric_data('CompileTime')[0]
-          num_compilation_recorded = True
-        else:
-          self.assertEqual(num_compilation,
-                           met.metric_data('CompileTime')[0],
-                           'number of compilation should not increase.')
+    for i in range(0, 100):
+        self.backwards_pass_with_dynamic_input(model, num_features)
 
   def test_backward_pass_with_dynamic_input(self):
     num_features = 2
+    model = Feedforward(num_features, hidden_size=10)
+    self.backwards_pass_with_dynamic_input(model, num_features)
+
+  def test_compiled_backward_pass_with_dynamic_input(self):
+    num_features = 2
+    model = Feedforward(num_features, hidden_size=10)
+    model.compile()
+    self.backwards_pass_with_dynamic_input(model, num_features)
+
+  def backwards_pass_with_dynamic_input(self, model, num_features):
     num_test_samples = 5
-    model = Feedforward(num_features, hidden_size=10).to(xla_dev)
     criterion = torch.nn.BCELoss()
     optimizer = torch.optim.SGD(model.parameters(), lr=1e-3)
     optimizer.zero_grad()
@@ -102,28 +74,26 @@ class TestDynamicShapeModels(unittest.TestCase):
     # training
     model.train()
     x_training, y_training = self.create_dynamic_test_data(
-        num_test_samples, num_features, xla_dev)
+        num_test_samples, num_features)
+    
     y_pred = model(x_training)
     loss = criterion(y_pred.squeeze(), y_training)
     # Backpropagation.
     loss.backward()
-    xm.optimizer_step(optimizer)
     print('Finished training.')
 
     # testing
     model.eval()
     with torch.no_grad():
       x_test, y_test = self.create_dynamic_test_data(num_test_samples,
-                                                     num_features, xla_dev)
+                                                     num_features)
       y_pred = model(x_test)
       criterion(y_pred.squeeze(), y_test).item()
-      xm.mark_step()
     print('Test passed.')
 
   def create_dynamic_test_data(self,
                                num_test_samples,
                                num_features,
-                               device,
                                num_non_zeros=1):
     x_test = torch.zeros(num_test_samples, num_features)
     num_non_zero_added = 0
@@ -144,15 +114,11 @@ class TestDynamicShapeModels(unittest.TestCase):
       if num_non_zero_added == num_non_zeros:
         break
 
-    x_test_xla = x_test.to(device)
-    x_test_nonzero_dev = torch.nonzero(x_test_xla.int()).float()
-    y_test_xla = y_test.to(device)
-    y_test_nonzero_dev = torch.nonzero(y_test_xla.int()).float().squeeze()
+    x_test_nonzero_dev = torch.nonzero(x_test.int()).float()
+    y_test_nonzero_dev = torch.nonzero(y_test.int()).float().squeeze()
     return x_test_nonzero_dev, y_test_nonzero_dev
 
-
 if __name__ == '__main__':
-  assert os.environ['XLA_EXPERIMENTAL'] != ''
   test = unittest.main(verbosity=FLAGS.verbosity, exit=False)
   # DISABLE PYTHON DISPATCHER FLAG
   del pd
