@@ -111,6 +111,48 @@ def get_fallback_ops():
   return fallback_ops
 
 
+# Checks that all input args that are tensors are on the same device.
+def _get_input_arg_device(input_args: tuple) -> torch.device:
+  device = None
+  for arg in input_args:
+    if not isinstance(arg, torch.Tensor):
+      continue
+
+    if device is None:
+      device = arg.device
+    else:
+      assert arg.device == device, "Not all args are on the same device."
+
+    return device
+
+
+# Given an input list, moves the tensors to the given target_device.
+# The output order will be the same as the input. Non tensors will also still
+# be in the list.
+def _maybe_move_tensors_to_device(tensors: List,
+                                  target_device: torch.device) -> List:
+  moved_tensors = []
+  for tensor in tensors:
+    if not isinstance(tensor, torch.Tensor):
+      moved_tensors.append(tensor)
+      continue
+
+    if tensor.device == target_device:
+      moved_tensors.append(tensor)
+      continue
+
+    if dynamo_debug:
+      print("Moving Tensor {} to device {}".format(tensor, target_device))
+
+    moved_tensor = tensor.to(target_device)
+    # Explicitly have to copy requires_grad attribute because it's dropped
+    # with torch.to(..)
+    moved_tensor.requires_grad = tensor.requires_grad
+    moved_tensors.append(moved_tensor)
+
+  return moved_tensors
+
+
 class Deduper:
 
   def __init__(self):
@@ -375,7 +417,7 @@ def extract_internal(xla_model: torch.fx.GraphModule):
   skip_checking_input_sharding_threashold = xu.getenv_as(
       'XLA_DYNAMO_INPUT_SHARDING_CHECK_THRESHOLD', int, 5)
 
-  def optimized_mod(*args):
+  def optimized_mod(*input_args):
     nonlocal xla_model
     nonlocal xla_args_sharding_spec
     nonlocal args_and_out
@@ -386,6 +428,9 @@ def extract_internal(xla_model: torch.fx.GraphModule):
     nonlocal dumb_return_handler
     nonlocal xla_args_need_update
     nonlocal skip_checking_input_sharding_threashold
+
+    original_device: torch.device = _get_input_arg_device(input_args)
+    args = _maybe_move_tensors_to_device(input_args, xm.xla_device())
 
     # mark_step needs to be blocking since we want to access args's XLADatas
     # and they can't be placeholder.
@@ -437,6 +482,8 @@ def extract_internal(xla_model: torch.fx.GraphModule):
     result = res[len(xla_args_need_update):]
 
     none_remover.add_nones(result)
+    result = _maybe_move_tensors_to_device(result, original_device)
+
     if len(result) == 1:
       return result[0]
     else:
@@ -531,7 +578,10 @@ class XLAConstructorMoverPass(ConstructorMoverPass):
     return (device is not None and device.type == self.target)
 
 
-def extract_compiled_graph(xla_model: torch.fx.GraphModule, xla_args):
+def extract_compiled_graph(xla_model: torch.fx.GraphModule, input_args):
+  xla_args = tuple(
+      _maybe_move_tensors_to_device(list(input_args), xm.xla_device()))
+
   # Synchronize xla_args, so that each FunctionalTensorWrapper argument updates its
   # value reference before actually computing it.
   for a in xla_args:
@@ -556,11 +606,8 @@ def extract_compiled_graph(xla_model: torch.fx.GraphModule, xla_args):
   all_xla_args = list(xla_args) + self_args
 
   for xla_arg in xla_args:
-    if xla_arg.device.type != 'xla':
-      warnings.warn(
-          "Found tensor with shape " + str(xla_arg.size()) + " on " +
-          str(xla_arg.device) +
-          ". Please move all tensors to xla device to execute on XLA device.")
+    assert xla_arg.device.type == 'xla', "Found tensor with shape " + str(
+        xla_arg.size()) + " on non-XLA device: " + str(xla_arg.device)
 
   cloned_args = [
       torch.clone(xla_arg) if isinstance(xla_arg, torch.Tensor) else xla_arg

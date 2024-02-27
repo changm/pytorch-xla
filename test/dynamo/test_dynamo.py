@@ -83,7 +83,7 @@ class DynamoInferenceBasicTest(unittest.TestCase):
     res_xla_dynamo = fn_simple_dynamo(xla_x, xla_y)
     self.assertIn('xla::add', met.counter_names())
     self.assertTrue(torch.allclose(res_cpu, res_xla_dynamo.cpu()))
-    # verifiy that tracing is skipped in following runs
+    # verify that tracing is skipped in following runs
     met.clear_counters()
     res_xla_dynamo_2 = fn_simple_dynamo(xla_x, xla_y)
     self.assertNotIn('xla::add', met.counter_names())
@@ -102,6 +102,49 @@ class DynamoInferenceBasicTest(unittest.TestCase):
                      torch_xla._XLAC._get_xla_tensor_debug_info(xla_xy))
     self.assertNotIn('XLAData: None',
                      torch_xla._XLAC._get_xla_tensor_debug_info(xla_y3))
+
+  # Tests that the dynamo bridge automatically moves tensors to XLA device
+  def test_simple_model_automoves_tensors(self):
+    xla_device = xm.xla_device()
+    x = torch.tensor(100.0)
+    y = torch.tensor(200.0)
+    eager_result = self.fn_simple(x, y)
+
+    fn_simple_dynamo = torch.compile(self.fn_simple, backend="openxla")
+    res_xla_dynamo = fn_simple_dynamo(x, y)
+    self.assertIn('xla::add', met.counter_names())
+    self.assertTrue(res_xla_dynamo.device == x.device)
+    self.assertTrue(torch.allclose(eager_result, res_xla_dynamo))
+
+    # verify that tracing is skipped in following runs
+    met.clear_counters()
+    res_xla_dynamo_reused = fn_simple_dynamo(x, y)
+    self.assertNotIn('xla::add', met.counter_names())
+    self.assertTrue(res_xla_dynamo_reused.device == x.device)
+    self.assertTrue(torch.allclose(eager_result, res_xla_dynamo_reused))
+
+    # verify that dynamo can handle different inputs
+    res_xla_dynamo_different = fn_simple_dynamo(x + y, y * 3)
+    res_cpu_3 = self.fn_simple(x + y, y * 3)
+    self.assertTrue(res_cpu_3.device == res_xla_dynamo_different.device)
+    self.assertTrue(torch.allclose(res_cpu_3, res_xla_dynamo_different))
+
+  def test_resnet_all_cpu_tensor_moved_to_xla(self):
+    met.clear_all()
+    input = torch.randn(4, 3, 224, 224)
+    resnet18 = torchvision.models.resnet18()
+    resnet18.eval()
+    dynamo_resnet18_cpu = torch.compile(resnet18, backend='openxla')
+
+    # input and model weight on cpu
+    with warnings.catch_warnings(record=True) as w:
+      res = dynamo_resnet18_cpu(input)
+      # there should be 18 paramters + 1 input all moved to XLA Device.
+      self.assertTrue(len(w) == 0)
+
+    # Ops should work automatically and XLA should "just work"
+    self.assertTrue(len(met.counter_names()) > 1)
+    self.assertIn('MarkStep', met.counter_names())
 
   def test_fn_without_input(self):
 
@@ -526,7 +569,7 @@ class DynamoTrainingOptimizerTest(unittest.TestCase):
         met.metric_data('RunCachedGraphOutputData')[0], sample_count * 3)
 
 
-class DynamErrorMessageTest(unittest.TestCase):
+class DynamoErrorMessageTest(unittest.TestCase):
 
   def test_mixed_cpu_tensor(self):
     device = xm.xla_device()
@@ -549,23 +592,6 @@ class DynamErrorMessageTest(unittest.TestCase):
       res = dynamo_resnet18_cpu(input_xla)
     self.assertTrue(
         'found two different devices' in context.exception.__str__())
-
-  def test_all_cpu_tensor(self):
-    met.clear_all()
-    input = torch.randn(4, 3, 224, 224)
-    resnet18 = torchvision.models.resnet18()
-    resnet18.eval()
-    dynamo_resnet18_cpu = torch.compile(resnet18, backend='openxla')
-    # input and model weight on cpu
-    with warnings.catch_warnings(record=True) as w:
-      res = dynamo_resnet18_cpu(input)
-      # there should be 18 paramters + 1 input
-      self.assertGreater(len(w), 15)
-      self.assertIn('Found tensor with shape torch.Size', str(w[0].message))
-    # no XLA operation should happens except a empty mark_step. Partitioner should offload all CPU
-    # ops to CPU.
-    self.assertEqual(len(met.counter_names()), 1)
-    self.assertIn('MarkStep', met.counter_names())
 
 
 if __name__ == '__main__':
