@@ -83,7 +83,7 @@ class DynamoInferenceBasicTest(unittest.TestCase):
     res_xla_dynamo = fn_simple_dynamo(xla_x, xla_y)
     self.assertIn('xla::add', met.counter_names())
     self.assertTrue(torch.allclose(res_cpu, res_xla_dynamo.cpu()))
-    # verifiy that tracing is skipped in following runs
+    # verify that tracing is skipped in following runs
     met.clear_counters()
     res_xla_dynamo_2 = fn_simple_dynamo(xla_x, xla_y)
     self.assertNotIn('xla::add', met.counter_names())
@@ -92,6 +92,29 @@ class DynamoInferenceBasicTest(unittest.TestCase):
     res_xla_dynamo_3 = fn_simple_dynamo(xla_x + xla_y, xla_y * 3)
     res_cpu_3 = self.fn_simple(x + y, y * 3)
     self.assertTrue(torch.allclose(res_cpu_3, res_xla_dynamo_3.cpu()))
+
+  # Tests that the dynamo bridge automatically moves tensors to XLA device
+  def test_simple_model_automoves_tensors(self):
+    device = xm.xla_device()
+    x = torch.tensor(100.0)
+    y = torch.tensor(200.0)
+    eager_result = self.fn_simple(x, y)
+
+    fn_simple_dynamo = torch.compile(self.fn_simple, backend="openxla")
+    res_xla_dynamo = fn_simple_dynamo(x, y)
+    self.assertIn('xla::add', met.counter_names())
+    self.assertTrue(torch.allclose(eager_result, res_xla_dynamo.cpu()))
+
+    # verify that tracing is skipped in following runs
+    met.clear_counters()
+    res_xla_dynamo_reused = fn_simple_dynamo(x, y)
+    self.assertNotIn('xla::add', met.counter_names())
+    self.assertTrue(torch.allclose(eager_result, res_xla_dynamo_reused.cpu()))
+
+    # verify that dynamo can handle different inputs
+    res_xla_dynamo_different = fn_simple_dynamo(x + y, y * 3)
+    res_cpu_3 = self.fn_simple(x + y, y * 3)
+    self.assertTrue(torch.allclose(res_cpu_3, res_xla_dynamo_different.cpu()))
 
   def test_fn_without_input(self):
 
@@ -356,6 +379,23 @@ class DynamoTrainingBasicTest(unittest.TestCase):
     res_xla_dynamo_3 = fn_simple_dynamo(xla_input * 2)
     res_cpu_3 = self.fn_simple(input * 2)
     self.assertTrue(torch.allclose(res_cpu_3, res_xla_dynamo_3.cpu()))
+    self.assertTrue(
+        torch.allclose(
+            input.grad, xla_input.grad.cpu(), rtol=1e-05, atol=1e-04))
+
+  def test_simple_model_automoves_tensors(self):
+    torch._dynamo.reset()
+    device = xm.xla_device()
+    input = torch.randn(3, 5, requires_grad=True)
+    res_cpu = self.fn_simple(input)
+
+    xla_input = input.detach()
+    xla_input.requires_grad = True
+    
+    fn_simple_dynamo = torch.compile(self.fn_simple, backend="openxla")
+    res_xla_dynamo = fn_simple_dynamo(xla_input)
+    self.assertIn('xla::nll_loss_backward', met.counter_names())
+    self.assertTrue(torch.allclose(res_cpu, res_xla_dynamo.cpu()))
     self.assertTrue(
         torch.allclose(
             input.grad, xla_input.grad.cpu(), rtol=1e-05, atol=1e-04))

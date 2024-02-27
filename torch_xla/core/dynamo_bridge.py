@@ -396,6 +396,7 @@ def extract_internal(xla_model: torch.fx.GraphModule):
     nonlocal dumb_return_handler
     nonlocal xla_args_need_update
     nonlocal skip_checking_input_sharding_threashold
+    print("Optimized mod")
 
     # mark_step needs to be blocking since we want to access args's XLADatas
     # and they can't be placeholder.
@@ -471,6 +472,7 @@ class UnsupportedNodesCollector(torch.fx.Interpreter):
 
   def run_node(self, n: torch.fx.Node):
     metrics.clear_counters()
+    print("N is {}".format(n))
     result = super().run_node(n)
     fallback_ops = get_fallback_ops()
     if len(fallback_ops) > 0:
@@ -491,6 +493,7 @@ class UnsupportedNodesCollector(torch.fx.Interpreter):
       # - a node whose result is a composition of XLA tensors:
       #   avoids non-XLA tensors as FX graph return value.
       result_is_supported = all_tensors_on_xla_device(result)
+      print("Result is supported {}".format(result_is_supported))
 
       # - a node that whose tensor arguments are XLA tensors:
       #   avoids non-XLA tensors as FX graph arguments.
@@ -498,6 +501,7 @@ class UnsupportedNodesCollector(torch.fx.Interpreter):
       args_are_supported = all(
           all_tensors_on_xla_device(v)
           for v in itertools.chain(args, kwargs.values()))
+      print("All args are supported {}".format(args_are_supported))
 
       # If the current node is NOT supported, we add it to
       # the _unsupported_nodes list.
@@ -544,13 +548,36 @@ class XLAConstructorMoverPass(ConstructorMoverPass):
     device = node.kwargs.get("device")
     return (device is not None and device.type == self.target)
 
+# Synchronize xla_args, so that each FunctionalTensorWrapper argument updates its
+# value reference before actually computing it.
+def synchronize_and_move_input_args(input_args: tuple):
+  print("\nInput args before are {}".format(input_args))
+  xla_args = []
+  for arg in input_args:
+    # TODO: When torch.compile(fn, dynamic=True), we'll have real arguments here.
+    # For now, we just assume tensors and pass the args as is.
+    if not isinstance(arg, torch.Tensor):
+      xla_args.append(arg)
+      continue
 
-def extract_compiled_graph(xla_model: torch.fx.GraphModule, xla_args):
-  # Synchronize xla_args, so that each FunctionalTensorWrapper argument updates its
-  # value reference before actually computing it.
-  for a in xla_args:
-    if isinstance(a, torch.Tensor) and torch._is_functional_tensor(a):
-      torch._functionalize_sync(a)
+    xla_arg = arg
+    if arg.device != xm.xla_device():
+      xla_arg = arg.to(xm.xla_device())
+      # Explicitly have to copy requires_grad attribute because it's dropped
+      # with torch.to(..)
+      xla_arg.requires_grad = arg.requires_grad
+
+    if torch._is_functional_tensor(xla_arg):
+      torch._functionalize_sync(xla_arg)
+
+    xla_args.append(xla_arg)
+
+  print("Returning xla args are {}".format(xla_args))
+  return tuple(xla_args)
+
+def extract_compiled_graph(xla_model: torch.fx.GraphModule, input_args):
+  xla_args = synchronize_and_move_input_args(input_args)
+  print("Extract compiled graph args {}".format(xla_args))
 
   # This call is critical to make sure xla_args' tensor id show up in graph_input_tensor_ids
   xm.mark_step()
@@ -570,19 +597,18 @@ def extract_compiled_graph(xla_model: torch.fx.GraphModule, xla_args):
   all_xla_args = list(xla_args) + self_args
 
   for xla_arg in xla_args:
-    if xla_arg.device.type != 'xla':
-      warnings.warn(
-          "Found tensor with shape " + str(xla_arg.size()) + " on " +
-          str(xla_arg.device) +
-          ". Please move all tensors to xla device to execute on XLA device.")
+    assert xla_arg.device.type == 'xla', "Found tensor with shape " + str(xla_arg.size()) + " on " + str(xla_arg.device)
 
   cloned_args = [
       torch.clone(xla_arg) if isinstance(xla_arg, torch.Tensor) else xla_arg
       for xla_arg in all_xla_args
   ]
 
+  
   # execute model once to collect fallback ops
   collector = UnsupportedNodesCollector(xla_model)
+
+  print("Final args are {}".format(xla_args))
   collector.run(*xla_args)
   unsupported_nodes = collector.get_unsupported_nodes()
   if (ptxla_debug or dynamo_debug) and len(unsupported_nodes) > 0:
