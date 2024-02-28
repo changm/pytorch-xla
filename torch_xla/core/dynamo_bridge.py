@@ -396,7 +396,7 @@ def extract_internal(xla_model: torch.fx.GraphModule):
     nonlocal dumb_return_handler
     nonlocal xla_args_need_update
     nonlocal skip_checking_input_sharding_threashold
-    print("Optimized mod")
+    print("Optimized mod args are {}".format(args))
 
     # mark_step needs to be blocking since we want to access args's XLADatas
     # and they can't be placeholder.
@@ -578,6 +578,8 @@ def synchronize_and_move_input_args(input_args: tuple):
 def extract_compiled_graph(xla_model: torch.fx.GraphModule, input_args):
   xla_args = synchronize_and_move_input_args(input_args)
   print("Extract compiled graph args {}".format(xla_args))
+  import traceback
+  traceback.print_stack()
 
   # This call is critical to make sure xla_args' tensor id show up in graph_input_tensor_ids
   xm.mark_step()
@@ -608,7 +610,7 @@ def extract_compiled_graph(xla_model: torch.fx.GraphModule, input_args):
   # execute model once to collect fallback ops
   collector = UnsupportedNodesCollector(xla_model)
 
-  print("Final args are {}".format(xla_args))
+  print("Before collector args are {}".format(xla_args))
   collector.run(*xla_args)
   unsupported_nodes = collector.get_unsupported_nodes()
   if (ptxla_debug or dynamo_debug) and len(unsupported_nodes) > 0:
