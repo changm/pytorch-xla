@@ -28,7 +28,6 @@ import torch_xla.utils.utils as xu
 dynamo_debug = int(os.environ.get('XLA_DYNAMO_DEBUG', '0')) == 1
 ptxla_debug = int(os.environ.get('PT_XLA_DEBUG', '0')) == 1
 
-
 @contextmanager
 def alias_with_buffer_donor_config(should_alias: bool = True):
   saved_config = torch_xla._XLAC._xla_get_should_alias_with_buffer_donor_config(
@@ -417,7 +416,10 @@ def extract_internal(xla_model: torch.fx.GraphModule):
   skip_checking_input_sharding_threashold = xu.getenv_as(
       'XLA_DYNAMO_INPUT_SHARDING_CHECK_THRESHOLD', int, 5)
 
-  def optimized_mod(*input_args):
+  global_nanoseconds = 0
+  global_compiles = 0
+
+  def optimized_mod(*args):
     nonlocal xla_model
     nonlocal xla_args_sharding_spec
     nonlocal args_and_out
@@ -428,9 +430,13 @@ def extract_internal(xla_model: torch.fx.GraphModule):
     nonlocal dumb_return_handler
     nonlocal xla_args_need_update
     nonlocal skip_checking_input_sharding_threashold
+    nonlocal global_compiles
+    nonlocal global_nanoseconds
 
-    original_device: torch.device = _get_input_arg_device(input_args)
-    args = _maybe_move_tensors_to_device(input_args, xm.xla_device())
+    start_counter = time.perf_counter_ns()
+
+    #original_device: torch.device = _get_input_arg_device(input_args)
+    #args = _maybe_move_tensors_to_device(input_args, xm.xla_device())
 
     # mark_step needs to be blocking since we want to access args's XLADatas
     # and they can't be placeholder.
@@ -482,7 +488,16 @@ def extract_internal(xla_model: torch.fx.GraphModule):
     result = res[len(xla_args_need_update):]
 
     none_remover.add_nones(result)
-    result = _maybe_move_tensors_to_device(result, original_device)
+    #result = _maybe_move_tensors_to_device(result, original_device)
+
+    end_counter = time.perf_counter_ns()
+
+    global_nanoseconds += end_counter - start_counter
+    global_compiles += 1
+
+    if global_compiles == 100:
+      average_compilation_time = float(global_nanoseconds) / float(global_compiles)
+      print("Average compilation time: {} over {}".format(average_compilation_time, global_compiles))
 
     if len(result) == 1:
       return result[0]

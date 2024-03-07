@@ -129,6 +129,24 @@ class DynamoInferenceBasicTest(unittest.TestCase):
     self.assertTrue(res_cpu_3.device == res_xla_dynamo_different.device)
     self.assertTrue(torch.allclose(res_cpu_3, res_xla_dynamo_different))
 
+  def test_benchmark_resnet(self):
+    input = torch.randn(4, 3, 224, 224)
+    input = input.to(xm.xla_device())
+
+    resnet50 = torchvision.models.resnet50().to(xm.xla_device())
+    resnet50.eval()
+    dynamo_resnet50 = torch.compile(resnet50, backend='openxla')
+
+    result = None
+    for i in range(0, 100):
+      res = dynamo_resnet50(input)
+      if result is None:
+        result = res
+      else:
+        result += res
+
+    print(result.cpu())
+      
   def test_resnet_all_cpu_tensor_moved_to_xla(self):
     met.clear_all()
     input = torch.randn(4, 3, 224, 224)
@@ -139,6 +157,7 @@ class DynamoInferenceBasicTest(unittest.TestCase):
     # input and model weight on cpu
     with warnings.catch_warnings(record=True) as w:
       res = dynamo_resnet18_cpu(input)
+      print(res)
       # there should be 18 paramters + 1 input all moved to XLA Device.
       self.assertTrue(len(w) == 0)
 
