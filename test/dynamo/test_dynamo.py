@@ -103,9 +103,9 @@ class DynamoInferenceBasicTest(unittest.TestCase):
     self.assertNotIn('XLAData: None',
                      torch_xla._XLAC._get_xla_tensor_debug_info(xla_y3))
 
-  # Tests that the dynamo bridge automatically moves tensors to XLA device
+  # Tests that the dynamo bridge automatically moves tensors to XLA device,
+  # then back to the original device.
   def test_simple_model_automoves_tensors(self):
-    xla_device = xm.xla_device()
     x = torch.tensor(100.0)
     y = torch.tensor(200.0)
     eager_result = self.fn_simple(x, y)
